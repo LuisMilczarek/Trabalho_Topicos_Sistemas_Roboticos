@@ -15,7 +15,7 @@ class BugNode(Node):
         super().__init__("bug_node")
 
         self.angle = np.radians(90)
-        self.threshold = 0.5
+        self.threshold = 0.7
 
         self.odom = None
         self.laser = None
@@ -47,8 +47,28 @@ class BugNode(Node):
     def laser_cb(self, msg: LaserScan):
         self.laser = msg
 
-    def getPointToLineDistance(self,P1,P2,P3) -> float:
-        return np.linalg.norm(np.cross(P2-P1, P1-P3))/np.linalg.norm(P2-P1)
+    # def getPointToLineDistance(self,P1,P2,P3) -> float:
+    #     return np.linalg.norm(np.cross(P2-P1, P1-P3))/np.linalg.norm(P2-P1)
+
+    def getPointToLineDistance(self, P1, P2, P3) -> float:
+        """
+        Calculate the shortest distance from point P3 to the line segment defined by P1 and P2.
+        """
+        line_vec = P2 - P1
+        point_vec = P3 - P1
+        line_len_sq = np.dot(line_vec, line_vec)
+        
+        # Protect against divide-by-zero if P1 == P2
+        if line_len_sq == 0.0:
+            return np.linalg.norm(P3 - P1)
+
+        # Project point_vec onto line_vec to find parameterized t
+        t = np.dot(point_vec, line_vec) / line_len_sq
+        t = np.clip(t, 0.0, 1.0)  # Clamp t to segment range [0,1]
+
+        # Find projection on the segment
+        projection = P1 + t * line_vec
+        return np.linalg.norm(P3 - projection)
     
     def getAngleIdx(self, angle : float, min : float, max, size : int) -> int:
         return int((angle - min) * size / (max - min))
@@ -88,16 +108,21 @@ class BugNode(Node):
         min_distance = min(readings)
 
         msg = Twist()
+        if(np.linalg.norm(pos-target)) < 0.5:
+            self.timer.cancel()
+            self.get_logger("Got to target")
+            return
         if self.state == "MOVE":
             if min_distance < self.threshold:
                 self.obstacle_orig = pos
                 self.state = "FOLLOW"
-                self.get_logger().info(f"State changed to: {self.state}")
+                self.get_logger().info(f"State changed to: {self.state} from point {pos}")
             else:
                 msg.linear.x = 0.5 * 2 
                 msg.angular.z = 1.0 * angle_deviation * 2
 
         elif self.state == "FOLLOW":
+            angle_idx_corner = int(120 / (2*self.laser.angle_increment))
             distance_to_line = self.getPointToLineDistance(self.obstacle_orig, target, pos)
             if self.follow_state == "CLOSING" and 0.1 > distance_to_line:
                 self.state = "MOVE"
@@ -105,28 +130,27 @@ class BugNode(Node):
                 self.get_logger().info(f"State changed to: {self.state}")
                 self.get_logger().info(f"Follow state changed to: {self.follow_state}")
             else:
-                corner_idx = self.getAngleIdx(np.radians(45),min_laser, max_laser, size)
-                side_readings = scans[corner_idx-angle_idx:corner_idx+angle_idx]
+                corner_idx = self.getAngleIdx(np.radians(180),min_laser, max_laser, size)
+                side_readings = scans[max(0,corner_idx-angle_idx_corner):min(corner_idx+angle_idx_corner, size-1)]
                 corner_distance = min(side_readings)
                 if self.follow_state == "AWAY" and distance_to_line > 0.2:
                     self.follow_state = "CLOSING"
                     self.get_logger().info(f"Follow state changed to: {self.follow_state}")
-                if corner_distance > self.threshold and min_distance > self.threshold:
-                    msg.linear.x = 0.1*2
-                    msg.angular.z = -0.3*2
+                elif corner_distance < self.threshold + 0.1 and corner_distance > self.threshold - 0.1 and min_distance > self.threshold and corner_distance > self.threshold:
+                    msg.linear.x = 1.0
+                    msg.angular.z = 0.0
+                elif corner_distance > self.threshold and min_distance > self.threshold:
+                    msg.linear.x = min(0.5,max(0, min_distance))
+                    msg.angular.z = -0.6
                 else:
-                    msg.linear.x = 0.1*2
-                    msg.angular.z = 0.3*2
+                    msg.linear.x = min(0.5,max(0, min_distance))*0.3
+                    msg.angular.z = 0.6
         else:
             raise ValueError(f"Unknown state: {self.state}")           
 
         
         self.pub.publish(msg)
         return
-        
-        
-
-
 
 def main(args=None):
     rclpy.init(args=args)
