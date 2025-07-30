@@ -1,5 +1,7 @@
 # Trabalho 1 - Robô Navegador
 
+Alunos: Luís Felipe Milczarek, Vitor Werk de Anello
+
 Para rodar a simulação, basta clonar este repositorio para a pasta src do workspace, buildar e rodar o comando a baixo:
 
 ```bash
