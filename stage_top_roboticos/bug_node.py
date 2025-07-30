@@ -1,164 +1,243 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
+import math
+import enum
 import rclpy
 import numpy as np
-
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from tf_transformations import euler_from_quaternion
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+
+from geometry_msgs.msg import Twist, Pose, PoseStamped
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
+from tf_transformations import euler_from_quaternion
+
+class BotState(enum.Enum):
+    LOOK_TOWARDS = 0  # rotate bots towards the goal
+    GOAL_SEEK = 1  # follow line
+    WALL_FOLLOW = 2  # Go around the wall / avoid obstacles
 
 class BugNode(Node):
+
     def __init__(self):
         super().__init__("bug_node")
+        self.get_logger().info("Starting Node")
 
-        self.angle = np.radians(90)
-        self.threshold = 0.7
 
-        self.odom = None
-        self.laser = None
 
-        self.state = "MOVE"
-        self.follow_state = "AWAY"
+        self.yaw = 0
+        self.yaw_threshold = math.pi / 90
+        self.goal_distance_threshold = 0.25
+        self.currentBotState = BotState.LOOK_TOWARDS
 
-        sub_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            durability=DurabilityPolicy.VOLATILE,
-            depth=1
-        )
-        self.odom_sub = self.create_subscription(Odometry,"/ground_truth", self.odom_cb, qos_profile=sub_qos)
-        self.laser_sub = self.create_subscription(LaserScan,"/base_scan", self.laser_cb, qos_profile=sub_qos)
-        
-        pub_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            durability=DurabilityPolicy.VOLATILE,
-            depth=1
-        )
-        self.pub = self.create_publisher(Twist,"/cmd_vel", qos_profile=pub_qos)
-        self.timer = self.create_timer(1/60, self.run)
+        # base scan laser range values
+        self.maxRange = 3
+        self.minRange = 0
 
-    def odom_cb(self, msg: Odometry):
-        self.odom = msg
+        self.bot_pose = None
+        self.init_bot_pose = []
+        self.beacon_pose = None
+        self.bot_motion = None  # cmd_vel publisher
+        self.homing_signal = None  # subscriber
+        self.init_config_complete = False
+        self.wall_hit_point = None
+        self.beacon_found = False
+        self.twist = Twist()
+        self.distance_moved = 0
+
+        self.front_obs_distance = None
+        self.left_obs_distance = None
+
+        self.wall_folllowing = False
+        self.load_waypoints()
+        self.init()
     
-    def laser_cb(self, msg: LaserScan):
-        self.laser = msg
+    def load_waypoints(self):
 
-    # def getPointToLineDistance(self,P1,P2,P3) -> float:
-    #     return np.linalg.norm(np.cross(P2-P1, P1-P3))/np.linalg.norm(P2-P1)
+        self.waypoint_index = 0
+        self.waypoints : list[Pose] = []
+        self.waypoints.append(Pose())
+        self.waypoints[-1].position.x = 7.0
+        self.waypoints[-1].position.y = 7.0
+        self.waypoints.append(Pose())
+        self.waypoints[-1].position.x = 7.0
+        self.waypoints[-1].position.y = -3.0
 
-    def getPointToLineDistance(self, P1, P2, P3) -> float:
-        """
-        Calculate the shortest distance from point P3 to the line segment defined by P1 and P2.
-        """
-        line_vec = P2 - P1
-        point_vec = P3 - P1
-        line_len_sq = np.dot(line_vec, line_vec)
-        
-        # Protect against divide-by-zero if P1 == P2
-        if line_len_sq == 0.0:
-            return np.linalg.norm(P3 - P1)
+    def normalize(self, angle):
+        if math.fabs(angle) > math.pi:
+            angle = angle - (2 * math.pi * angle) / (math.fabs(angle))
+        return angle
 
-        # Project point_vec onto line_vec to find parameterized t
-        t = np.dot(point_vec, line_vec) / line_len_sq
-        t = np.clip(t, 0.0, 1.0)  # Clamp t to segment range [0,1]
 
-        # Find projection on the segment
-        projection = P1 + t * line_vec
-        return np.linalg.norm(P3 - projection)
-    
-    def getAngleIdx(self, angle : float, min : float, max, size : int) -> int:
-        return int((angle - min) * size / (max - min))
-    
-    def run(self):
-        if self.odom is None or self.laser is None:
-            return
-        
-        pos = np.array([self.odom.pose.pose.position.x, self.odom.pose.pose.position.y])
+    def look_towards(self, des_pos):
+        # global yaw, yaw_threshold, bot_motion, currentBotState, twist
+        quaternion = (
+            des_pos.orientation.x,
+            des_pos.orientation.y,
+            des_pos.orientation.z,
+            des_pos.orientation.w)
+        euler = euler_from_quaternion(quaternion)
+        yaw = euler[2]  # bot's yaw
+        beacon_yaw = math.atan2(self.beacon_pose.position.y - des_pos.position.y, self.beacon_pose.position.x - des_pos.position.x)
+        yaw_diff = self.normalize(beacon_yaw - yaw)
 
-        target = np.array([7,7])
+        if math.fabs(yaw_diff) > self.yaw_threshold:
+            self.twist.angular.z = -0.5  # clockwise rotation if yaw_diff > 0 else 0.5  # counter-clockwise rotation
 
-        _, __, theta = euler_from_quaternion([self.odom.pose.pose.orientation.x,
-                                       self.odom.pose.pose.orientation.y,
-                                       self.odom.pose.pose.orientation.z,
-                                       self.odom.pose.pose.orientation.w])
-        # theta += np.pi/4
-        
-        angle_idx = int(self.angle / (2*self.laser.angle_increment))
+        if math.fabs(yaw_diff) <= self.yaw_threshold:
+            self.twist.angular.z = 0.0
+            self.currentBotState = BotState.GOAL_SEEK
+            self.get_logger().info("Goal Seek")
+        self.bot_motion_pub.publish(self.twist)
 
-        dist = target - pos
-        angle_to_target = np.arctan2(dist[0],dist[1])
-        if angle_to_target < 0:
-            angle_to_target + (2*np.pi)
-        
-        angle_deviation = angle_to_target - theta 
-        if angle_deviation > np.pi:
-            angle_deviation -= 2*np.pi
-        
-        scans = self.laser.ranges
-        min_laser = self.laser.angle_min
-        max_laser = self.laser.angle_max
-        size = len(scans)
-        middle = size//2
-        
-        readings = scans[middle-angle_idx:middle+angle_idx]
-        min_distance = min(readings)
 
-        msg = Twist()
-        if(np.linalg.norm(pos-target)) < 0.5:
-            self.timer.cancel()
-            self.get_logger("Got to target")
-            return
-        if self.state == "MOVE":
-            if min_distance < self.threshold:
-                self.obstacle_orig = pos
-                self.state = "FOLLOW"
-                self.get_logger().info(f"State changed to: {self.state} from point {pos}")
-            else:
-                msg.linear.x = 0.5 * 2 
-                msg.angular.z = 1.0 * angle_deviation * 2
+    def goal_seek(self):
+        # global zone_F, currentBotState, bot_pose, wall_hit_point, front_obs_distance, left_obs_distance
 
-        elif self.state == "FOLLOW":
-            angle_idx_corner = int(120 / (2*self.laser.angle_increment))
-            distance_to_line = self.getPointToLineDistance(self.obstacle_orig, target, pos)
-            if self.follow_state == "CLOSING" and 0.1 > distance_to_line:
-                self.state = "MOVE"
-                self.follow_state = "AWAY"
-                self.get_logger().info(f"State changed to: {self.state}")
-                self.get_logger().info(f"Follow state changed to: {self.follow_state}")
-            else:
-                corner_idx = self.getAngleIdx(np.radians(180),min_laser, max_laser, size)
-                side_readings = scans[max(0,corner_idx-angle_idx_corner):min(corner_idx+angle_idx_corner, size-1)]
-                corner_distance = min(side_readings)
-                if self.follow_state == "AWAY" and distance_to_line > 0.2:
-                    self.follow_state = "CLOSING"
-                    self.get_logger().info(f"Follow state changed to: {self.follow_state}")
-                elif corner_distance < self.threshold + 0.1 and corner_distance > self.threshold - 0.1 and min_distance > self.threshold and corner_distance > self.threshold:
-                    msg.linear.x = 1.0
-                    msg.angular.z = 0.0
-                elif corner_distance > self.threshold and min_distance > self.threshold:
-                    msg.linear.x = min(0.5,max(0, min_distance))
-                    msg.angular.z = -0.6
-                else:
-                    msg.linear.x = min(0.5,max(0, min_distance))*0.3
-                    msg.angular.z = 0.6
+        obstacle_in_front = np.any((self.zone_F < 0.85))
+        distance_bot_to_target = math.sqrt(pow(self.bot_pose.position.y - self.beacon_pose.position.y, 2) + pow(self.bot_pose.position.x - self.beacon_pose.position.x, 2))
+        if obstacle_in_front and np.any((self.zone_F < distance_bot_to_target)):
+            self.twist.linear.x = 0.0
+            self.wall_hit_point = self.bot_pose.position
+            self.currentBotState = BotState.WALL_FOLLOW
+            self.get_logger().info("Wall Follow")
         else:
-            raise ValueError(f"Unknown state: {self.state}")           
+            self.twist.angular.z = 0.0
+            self.twist.linear.x = 0.5
+        self.bot_motion_pub.publish(self.twist)
 
+
+    def wall_follow(self):
+        obstacle_in_front = np.any((self.zone_F < self.front_obs_distance))
+        distance_moved = math.sqrt(pow(self.bot_pose.position.y - self.wall_hit_point.y, 2) + pow(self.bot_pose.position.x - self.wall_hit_point.x, 2))
+        distance_hit_to_target = math.sqrt(pow(self.beacon_pose.position.y - self.wall_hit_point.y, 2) + pow(self.beacon_pose.position.x - self.wall_hit_point.x, 2))
+        distance_bot_to_target = math.sqrt(pow(self.bot_pose.position.y - self.beacon_pose.position.y, 2) + pow(self.bot_pose.position.x - self.beacon_pose.position.x, 2))
+        # self.get_logger().info("1")
+
+        if self.line_distance() < 0.2 and distance_moved > 0.5 and distance_hit_to_target > distance_bot_to_target:
+            # self.get_logger().info("2")
+            print("line_hit")
+            print(distance_moved)
+            # found line point. rotate and move forward
+            self.twist.angular.z = 0.0
+            self.twist.linear.x = 0.0
+            self.currentBotState = BotState.LOOK_TOWARDS
+            self.get_logger().info("look towards")
+            return
+        elif obstacle_in_front:  # turn right
+            # self.get_logger().info("3")
+            self.twist.angular.z = -0.5
+            self.twist.linear.x = 0.0
+        elif np.all((self.zone_FL >= self.left_obs_distance)):  # or np.any((zone_FR <= 1)):  # turn left
+            # self.get_logger().info("4")
+            self.twist.angular.z = 0.5
+            self.twist.linear.x = 0.1
+        else:
+            # self.get_logger().info("5")
+            self.twist.angular.z = 0.0  # move forward
+            self.twist.linear.x = 0.5
+
+        self.bot_motion_pub.publish(self.twist)
+
+
+    def line_distance(self):
+        # global init_bot_pose, beacon_pose, bot_pose
+        point_1 = self.init_bot_pose  # in form of array
+        point_2 = self.beacon_pose.position
+        point_k = self.bot_pose.position
+        numerator = math.fabs((point_2.y - point_1[1]) * point_k.x - (point_2.x - point_1[0]) * point_k.y + (point_2.x * point_1[1]) - (point_2.y * point_1[0]))
+        denominator = math.sqrt(pow(point_2.y - point_1[1], 2) + pow(point_2.x - point_1[0], 2))
+        return numerator / denominator
+
+
+    # def callback(self, msg : PoseStamped):
+    #     self.beacon_pose = msg.pose
+    #     self.check_init_config()
+
+    def get_base_truth(self, bot_data : Odometry):
+        self.bot_pose = bot_data.pose.pose
+        if not self.init_config_complete:
+            self.check_init_config()
+
+        if self.beacon_pose is not None:
+            goal_distance = math.sqrt(pow(self.bot_pose.position.y - self.beacon_pose.position.y, 2) + pow(self.bot_pose.position.x - self.beacon_pose.position.x, 2))
+            if goal_distance <= self.goal_distance_threshold:
+                self.get_logger().info(f"Waypoint {self.waypoint_index} found")
+                self.waypoint_index += 1
+                if  self.waypoint_index < len(self.waypoints):
+                    self.currentBotState = BotState.LOOK_TOWARDS
+                    self.beacon_pose = self.waypoints[self.waypoint_index]
+                    self.get_logger().info(f"Going to x: {self.beacon_pose.position.x}, y: {self.beacon_pose.position.y}")
+                else:
+                    self.beacon_found = True
+                    self.get_logger().info("Done!!")
+
+    def idle(self):
+        self.twist.linear.x = 0.0
+        self.twist.angular.z = 0.0
+        self.bot_motion_pub.publish(self.twist)
+        self.get_logger().info("Waypoint found!!")
+
+
+    def process_sensor_info(self, data : LaserScan):
         
-        self.pub.publish(msg)
-        return
+        self.maxRange = data.range_max
+        self.minRange = data.range_min
+        zone = np.array(data.ranges)
+        self.zone_R = zone[0:5]  
+        self.zone_FR = zone[6:94]
+        self.zone_F = zone[95:175]
+        self.zone_FL = zone[176:265]
+        self.zone_L = zone[266:270]
+        if self.front_obs_distance is None and self.left_obs_distance is None:
+            self.front_obs_distance = 1
+            self.left_obs_distance = 1
 
-def main(args=None):
+
+    def check_init_config(self):
+        if self.bot_pose is not None and self.beacon_pose is not None:
+            self.init_config_complete = True
+            self.init_bot_pose = [self.bot_pose.position.x, self.bot_pose.position.y]
+            self.runtime = self.create_timer(1/10, self.bot_bug2)
+            self.get_logger().info("Inited")
+
+
+    def bot_bug2(self):
+
+        if not self.init_config_complete:
+            return
+        if self.beacon_found:
+            self.runtime.cancel()
+            self.idle()
+        elif self.currentBotState is BotState.LOOK_TOWARDS:
+            self.look_towards(self.bot_pose)
+        elif self.currentBotState is BotState.GOAL_SEEK:
+            self.goal_seek()
+        elif self.currentBotState is BotState.WALL_FOLLOW:
+            self.wall_follow()            
+
+
+
+    def init(self):
+        
+        self.bot_motion_pub = self.create_publisher(Twist,"/cmd_vel", qos_profile=10)
+        # self.homing_signal_sub = self.create_subscription(PoseStamped,'/homing_signal', self.callback, qos_profile=10)
+        self.base_scan_sub = self.create_subscription(LaserScan, '/base_scan', self.process_sensor_info, qos_profile=10)
+        self.ground_truth_sub = self.create_subscription(Odometry, '/ground_truth', self.get_base_truth, qos_profile=10)
+        self.beacon_pose = self.waypoints[self.waypoint_index]
+        self.get_logger().info("Subscription made")
+        
+
+    
+
+
+def main(args=None) -> None:
     rclpy.init(args=args)
-    node  = BugNode()
+    node = BugNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-
     rclpy.try_shutdown()
-    
+
+if __name__ == "__main__":
+    main()
